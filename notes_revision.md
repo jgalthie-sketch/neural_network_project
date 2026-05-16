@@ -319,3 +319,376 @@ Indispensable pour :
 
 Si seed=None, le générateur est initialisé avec une source d'entropie système
 (horloge, etc.) → résultats différents à chaque exécution.
+
+## Phase 3 — Implémentation du Régresseur
+
+### 3.1 Forward propagation
+
+**Équations du réseau (one hidden layer, regression)**
+
+    z₁ = X @ W₁ + b₁              (combinaison linéaire couche cachée)
+    a₁ = σ(z₁)                    (activation non-linéaire)
+    z₂ = a₁ @ W₂ + b₂             (combinaison linéaire sortie)
+    ŷ  = z₂                       (sortie = identité, pour régression)
+
+**Shapes**
+
+    X     : (n_samples, n_features)
+    W₁    : (n_features, H)        H = hidden_layer_size
+    b₁    : (H,)
+    z₁,a₁ : (n_samples, H)
+    W₂    : (H, n_outputs)
+    b₂    : (n_outputs,)
+    z₂,ŷ  : (n_samples, n_outputs)
+
+**Broadcasting du biais**
+
+X @ W₁ a shape (n_samples, H). b₁ a shape (H,). Numpy ajoute b₁ à
+chaque ligne automatiquement (broadcasting). Équivalent à dupliquer
+b₁ verticalement n_samples fois, mais sans coût mémoire.
+
+**Pourquoi retourner z₁, a₁, z₂, ŷ (et pas seulement ŷ) ?**
+
+La backpropagation a besoin de tous les états intermédiaires pour
+calculer les gradients (chain rule). On les mémorise au forward pass
+plutôt que de les recalculer. Trade-off mémoire/temps : standard en DL.
+
+**Pourquoi pas d'activation en sortie pour la régression ?**
+
+On veut prédire un nombre réel ŷ ∈ ℝ. Toute activation bornée (sigmoid,
+tanh) limiterait la plage de sortie. L'identité (= pas d'activation)
+laisse z₂ tel quel → ŷ peut prendre n'importe quelle valeur réelle,
+adapté à la plupart des cibles continues.
+
+Note : si la cible est positive (ex. prix), on pourrait utiliser ReLU
+ou softplus en sortie. Mais identity reste le défaut sklearn-compatible.
+
+
+### 3.2 Loss : Mean Squared Error
+
+**Définition**
+
+    MSE = (1/n) Σᵢ (yᵢ - ŷᵢ)²
+
+Propriétés :
+- ≥ 0 toujours, = 0 ssi prédiction parfaite
+- Pénalise quadratiquement → outliers ont fort impact
+- Différentiable partout (clé pour gradient descent)
+
+**Pourquoi quadratique et pas |.|**
+
+1. Différentiabilité : |x| a un point anguleux en 0, x² est lisse partout.
+2. Outliers : pénalisation forte des grosses erreurs → corrige en priorité.
+3. Solution analytique connue : MSE est la log-vraisemblance d'un modèle
+   gaussien (bruit normal), liaison avec la statistique classique.
+
+Alternative : MAE = (1/n)Σ|yᵢ - ŷᵢ|, plus robuste aux outliers mais
+non différentiable en 0. Non demandé ici.
+
+**Pourquoi cette loss correspond à la sortie identité**
+
+Comme softmax+cross_entropy ou sigmoid+binary_cross_entropy, le couple
+identity+MSE est un "matched pair" issu des GLM (modèles linéaires
+généralisés). Sa dérivée combinée se simplifie en :
+
+    ∂L/∂z₂ = ŷ - y_true
+
+C'est exactement la même forme que pour les autres matched pairs.
+Conséquence : la backprop sera élégante (Phase 3.3).
+
+### 3.3 Backpropagation
+
+**Objectif**
+
+Calculer ∂L/∂W₁, ∂L/∂b₁, ∂L/∂W₂, ∂L/∂b₂ — les 4 gradients qui
+indiquent comment modifier chaque paramètre pour faire baisser la loss.
+
+**Outil mathématique : chain rule**
+
+Si y = f(g(x)), alors dy/dx = f'(g(x)) · g'(x).
+Dans le réseau, la loss dépend de z₂ qui dépend de W₂ et a₁,
+qui dépend de z₁ qui dépend de W₁. On applique la chain rule
+en remontant cette chaîne depuis la sortie.
+
+**Démonstration étape par étape (régression, identity + MSE)**
+
+Notations : n = nb_samples, L = (1/n) Σ (yᵢ - ŷᵢ)², ŷ = z₂.
+
+(1) Gradient à la couche de sortie
+
+    ∂L/∂z₂ = ∂/∂z₂ [(1/n) Σ (y - z₂)²]
+           = (1/n) · 2 · (z₂ - y) · (-(-1))
+           = (2/n) · (ŷ - y)
+
+    Le facteur 2 est constant : on l'absorbe dans le learning rate.
+    En pratique on utilise :
+        dz₂ = (1/n) · (ŷ - y)
+
+    Note : c'est la même forme que pour (sigmoid + binary_CE) en classif
+    binaire et (softmax + CE) en multi-classe. Coïncidence apparente,
+    propriété profonde des "matched pairs" loss/activation (cadre GLM).
+
+(2) Gradients de la couche de sortie
+
+    z₂ = a₁ W₂ + b₂   →  linéaire en W₂ et b₂
+
+    dW₂ = a₁ᵀ · dz₂        (shape : (H, n_outputs))
+    db₂ = Σ_samples dz₂    (somme sur axis=0)
+
+    Pourquoi la transposée ? La règle matricielle dit que si y = A·x,
+    alors ∂y/∂A = x · (extérieurement). En batchant sur n samples,
+    on accumule via aᵀ·dz.
+
+    Pourquoi sommer pour db₂ ? b₂ est PARTAGÉ entre les n samples
+    (même biais pour tout le batch). Donc son gradient = somme des
+    contributions de chaque sample.
+
+(3) Gradient propagé à la couche cachée
+
+    a₁ = σ(z₁), z₂ = a₁ W₂ + b₂
+
+    da₁ = dz₂ · W₂ᵀ                 (chain rule, shape (n, H))
+    dz₁ = da₁ ⊙ σ'(z₁)              (⊙ = multiplication élément par élément)
+
+    Pourquoi élément par élément ? σ agit composante par composante
+    sur z₁, donc sa dérivée aussi : (σ(z))ᵢ ne dépend que de zᵢ.
+    Matriciellement, dσ/dz est une matrice diagonale, dont le produit
+    avec un vecteur revient à une multiplication composante par composante.
+
+(4) Gradients de la couche cachée
+
+    z₁ = X W₁ + b₁   →  symétrique à l'étape (2)
+
+    dW₁ = Xᵀ · dz₁    (shape : (n_features, H))
+    db₁ = Σ_samples dz₁
+
+**Pattern à retenir**
+
+Pour chaque couche, on calcule dz (la "responsabilité" de cette couche
+dans l'erreur), puis localement dW et db, puis on propage à la couche
+précédente via dz_prev = dz · Wᵀ ⊙ σ'(z_prev).
+
+C'est ce pattern qu'on appellera "backward propagation" — le gradient
+"se propage" de la sortie vers l'entrée, en sens inverse du forward pass.
+
+**Vérification des shapes (essentiel pour débugger)**
+
+    X      : (n, n_features)
+    W₁     : (n_features, H)        Xᵀ : (n_features, n)
+    z₁,a₁  : (n, H)
+    W₂     : (H, n_outputs)         W₂ᵀ : (n_outputs, H)
+    z₂,ŷ,y : (n, n_outputs)
+    
+    dz₂    : (n, n_outputs)         comme z₂ ✓
+    dW₂    : (H, n_outputs)         a₁ᵀ @ dz₂ = (H,n)@(n,n_out) ✓
+    db₂    : (n_outputs,)           sum(dz₂, axis=0) ✓
+    dz₁    : (n, H)                 (n,n_out)@(n_out,H) = (n,H) ✓
+    dW₁    : (n_features, H)        Xᵀ @ dz₁ = (n_feat,n)@(n,H) ✓
+    db₁    : (H,)                   sum(dz₁, axis=0) ✓
+
+Astuce de soutenance : si le prof demande "comment t'assures-tu que
+les gradients ont la bonne shape ?", tu réponds que les gradients ont
+TOUJOURS la même shape que le paramètre qu'ils dérivent (dW₁ a shape
+de W₁, etc.) — et tu pointes le tableau ci-dessus.
+
+**Choix d'implémentation**
+
+- On divise dz₂ par n_samples ICI (et pas dans la loss) pour avoir
+  des gradients normalisés. Conséquence : on n'a pas besoin de moyenner
+  ailleurs.
+- On utilise @ pour les produits matriciels (lisible) et * pour
+  l'élément par élément. Erreur courante : confondre les deux.
+- np.sum(..., axis=0) : axis=0 = sommer le long des lignes, donc on
+  obtient un vecteur de longueur égale au nombre de colonnes — exactement
+  ce qu'il faut pour le biais.
+
+### 3.4 La méthode fit() — learning loop
+
+**Pseudocode**
+
+    fit(X, y):
+        normaliser y en shape (n, n_outputs)
+        initialiser W₁, b₁, W₂, b₂
+        loss_curve = []
+        répéter max_iter fois :
+            forward → z₁, a₁, z₂, ŷ
+            loss = MSE(y, ŷ)
+            loss_curve.append(loss)
+            backward → dW₁, db₁, dW₂, db₂
+            W₁ ← W₁ - η · dW₁
+            b₁ ← b₁ - η · db₁
+            W₂ ← W₂ - η · dW₂
+            b₂ ← b₂ - η · db₂
+        return self
+
+**Gradient descent : la règle de mise à jour**
+
+    W ← W - η · ∂L/∂W
+
+Intuition géométrique : ∂L/∂W pointe dans la direction de plus forte
+AUGMENTATION de la loss. Pour la DIMINUER, on va dans la direction
+opposée → signe moins. η contrôle la longueur du pas.
+
+Choix de η :
+- Trop grand → on saute par-dessus le minimum, la loss oscille ou diverge
+- Trop petit → on converge correctement mais très lentement
+- En pratique : 1e-3 à 1e-2 marche bien pour ce projet (cf. tests)
+
+**Pourquoi reshape y en 2D ?**
+
+La backprop calcule dz₂ = (ŷ - y) / n. Si ŷ a shape (n, 1) et y a
+shape (n,), numpy fait du broadcasting qui crée une shape (n, n) —
+résultat catastrophique. Forcer y à (n, 1) garantit que la soustraction
+est élément par élément, ligne par ligne.
+
+**Pourquoi convertir en float ?**
+
+Si y arrive en int (ex: targets entiers), numpy fait des opérations
+entières et arrondit les gradients à 0 → le réseau n'apprend rien.
+np.asarray(y, dtype=float) force la conversion.
+
+**Pourquoi réinitialiser loss_curve_ = [] à chaque fit() ?**
+
+Sinon, si l'utilisateur fait model.fit(X1, y1) puis model.fit(X2, y2),
+les courbes des deux trainings seraient concaténées. On veut une
+courbe propre par appel à fit().
+
+**Mode de descente : full-batch (vs mini-batch / SGD)**
+
+Notre implémentation utilise X **entier** à chaque itération
+(full-batch gradient descent). Avantages :
+- Gradient exact (pas de bruit stochastique)
+- Implémentation simple, code court
+- Bon comportement sur petits datasets (le projet)
+
+Inconvénients (pour info, pas implémenté ici) :
+- Coûteux en mémoire sur très gros datasets
+- Plus susceptible de tomber dans un minimum local (le bruit du SGD
+  peut au contraire aider à en sortir)
+
+Le brief mentionne mini-batch et SGD dans les "Advanced requirements"
+mais ne l'impose pas. On reste full-batch pour la simplicité.
+
+**Pourquoi return self ?**
+
+Convention scikit-learn : permet le chaînage
+    model = SimpleSLPRegressor().fit(X, y)
+au lieu de
+    model = SimpleSLPRegressor()
+    model.fit(X, y)
+Test test_reproducibility exploite cette convention.
+
+### 3.5 predict() et score()
+
+**predict() : forward pass sans apprentissage**
+
+Une fois fit() terminé, les poids W₁, b₁, W₂, b₂ sont fixés. predict()
+réutilise _forward_propagation(X) avec ces poids gelés. On ignore les
+intermédiaires (z₁, a₁, z₂) puisqu'on n'a pas besoin de la backprop.
+
+Reshape de sortie : si n_outputs = 1, on aplatit en 1D avec .ravel()
+pour suivre la convention sklearn (y_pred 1D pour single-target).
+Ce détail fait passer le test test_predict_shape_and_finite.
+
+**score() : le R² (coefficient de détermination)**
+
+Définition :
+
+    R² = 1 - SS_res / SS_tot
+    
+    SS_res = Σᵢ (yᵢ - ŷᵢ)²       (résidus du modèle)
+    SS_tot = Σᵢ (yᵢ - ȳ)²        (variance totale des y)
+
+Interprétation : proportion de la variance des y expliquée par le modèle.
+- R² = 1 → prédiction parfaite (SS_res = 0)
+- R² = 0 → le modèle équivaut à prédire la moyenne ȳ partout
+- R² < 0 → le modèle est PIRE qu'une prédiction constante = ȳ
+           (arrive sur test set difficile, modèle sous-entraîné, ou
+            quand y_train et y_test ont des distributions différentes)
+
+**Pourquoi R² plutôt que MSE comme métrique ?**
+
+MSE dépend de l'échelle des y : MSE = 100 n'a aucun sens absolu.
+- Sur prix d'avocats (1€-3€) : MSE=100 = catastrophe
+- Sur prix de maisons (100k€-1M€) : MSE=100 = excellent
+
+R² est ADIMENSIONNEL → comparable entre datasets. Convention sklearn :
+.score() retourne R² pour les régresseurs, accuracy pour les classifieurs.
+
+**Démonstration du cas R² = 0 (intéressant pour la soutenance)**
+
+Si on prédit ŷᵢ = ȳ pour tout i (modèle constant qui ignore X), alors :
+    SS_res = Σ (yᵢ - ȳ)² = SS_tot
+    R² = 1 - SS_tot/SS_tot = 0
+
+Donc R² = 0 c'est le baseline naïf. Un modèle utile DOIT faire mieux.
+
+**Pourquoi reproductibilité dans predict() ?**
+
+predict() est déterministe : pas de tirage aléatoire, pas d'init.
+Pour deux modèles entraînés avec le même random_state sur les mêmes
+données, predict(X_test) renvoie EXACTEMENT le même résultat — ce que
+vérifie test_reproducibility.
+
+**Choix d'implémentation**
+
+- predict() délègue à _forward_propagation() pour ne pas dupliquer
+  la math du forward.
+- score() délègue à predict() pour la même raison (DRY).
+- Pas de gestion d'erreur "modèle non entraîné" — on suppose que
+  l'utilisateur appelle fit() avant predict(). Sinon W1_ vaut None
+  et numpy lèvera une AttributeError explicite (None has no attribute T).
+
+### Phase 3 failed modifications 
+
+### Choix du défaut d'activation : relu plutôt que logistic
+
+Le scaffold du prof propose `activation: str = "logistic"` par défaut.
+On a remplacé par `"relu"` pour le régresseur. Justification :
+
+- Logistic en cachée borne a₁ ∈ [0,1] → z₂ = a₁W₂ + b₂ borné par
+  H·max(W₂) + b₂. Avec init σ=0.01 et H=20, sortie initiale ≈ 0.
+- Cibles régression peuvent être grandes (|y| ~ 10 dans test_linear_function).
+  Pour atteindre |ŷ| ~ 10 avec a₁ ≤ 1, il faut W₂ ~ 0.5 — partant de 0.01,
+  ça prend de très nombreuses itérations.
+- ReLU n'est pas bornée, dérivée = 1 pour z > 0 → convergence directe.
+- Alignement avec sklearn.MLPRegressor (default relu également).
+
+Le test test_linear_function (R² > 0.8) échouait avec logistic mais passe
+avec relu — illustration concrète de l'importance du choix d'activation
+pour la régression sur cibles à grande amplitude.
+
+### Choix du défaut de learning_rate : 0.01 plutôt que 0.001
+
+Même logique que pour l'activation : le scaffold reprenait les défauts
+sklearn (lr=0.001) qui sont calibrés pour le solveur adam (adaptatif).
+Notre implémentation utilisant un gradient descent vanille (full-batch SGD),
+0.001 est trop petit pour converger en max_iter=200 itérations dans le
+cas où la cible a une magnitude importante OU une moyenne non nulle.
+
+Exemple : test_constant_output (y=5 partout, max_iter=100).
+Avec lr=0.001, le réseau converge vers ŷ≈3.2 — bien mais insuffisant.
+Avec lr=0.01, ŷ atteint 5 dans la fenêtre de temps imposée.
+
+Trade-off : lr trop grand → divergence ou oscillation. lr=0.01 est un
+sweet spot empirique vérifié par les tests fournis.
+
+## Choix de l'écart-type d'initialisation : σ = 0.15
+
+Le brief suggère 0.01 en exemple, mais c'est trop petit pour ReLU :
+trop de neurones démarrent inactifs (z ≤ 0) → "dying ReLU" →
+convergence stagnante.
+
+Référence théorique : He initialization recommande σ_He = sqrt(2/n_features)
+pour ReLU. Donne :
+- n_features = 3  → σ_He ≈ 0.82
+- n_features = 10 → σ_He ≈ 0.45
+- n_features = 30 → σ_He ≈ 0.26
+
+Notre choix σ = 0.15 est un compromis conservateur : assez grand pour
+éviter le dying ReLU sur les petits réseaux des tests (n_features = 3),
+assez petit pour ne pas saturer tanh/sigmoid sur les grands réseaux.
+
+Alternative plus rigoureuse (non implémentée pour rester simple) :
+adapter σ à n_features selon He pour ReLU, Xavier pour tanh/sigmoid.
+Notre σ unique passe tous les tests sans complexifier le code.

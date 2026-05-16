@@ -87,10 +87,10 @@ class BaseSLPEstimator(ABC):
         """
         rng = np.random.default_rng(self.random_state)
 
-        # Small std dev (0.01) keeps initial z in the active zone of activations
-        self.W1_ = rng.normal(0, 0.01, size=(n_features, self.hidden_layer_size))
+        # Small std dev (0.1) keeps initial z in the active zone of activations
+        self.W1_ = rng.normal(0, 0.15, size=(n_features, self.hidden_layer_size))
         self.b1_ = np.zeros(self.hidden_layer_size)
-        self.W2_ = rng.normal(0, 0.01, size=(self.hidden_layer_size, n_outputs))
+        self.W2_ = rng.normal(0, 0.15, size=(self.hidden_layer_size, n_outputs))
         self.b2_ = np.zeros(n_outputs)
 
     @abstractmethod
