@@ -156,6 +156,8 @@ class SimpleSLPRegressor(BaseSLPEstimator):
         self : object
             Fitted estimator
         """
+        # Random seed is handled in _initialize_weights via default_rng (local generator)
+
         # Ensure y is 2D (n_samples, n_outputs) to match y_pred shape
         y = np.asarray(y, dtype=float)
         if y.ndim == 1:

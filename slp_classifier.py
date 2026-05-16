@@ -19,8 +19,8 @@ class SimpleSLPClassifier(BaseSLPEstimator):
     def __init__(
         self,
         hidden_layer_size: int = 100,
-        activation: str = "logistic",
-        learning_rate: float = 0.001,
+        activation: str = "relu",
+        learning_rate: float = 0.01,
         max_iter: int = 200,
         random_state: Optional[int] = None,
     ) -> None:
@@ -67,8 +67,15 @@ class SimpleSLPClassifier(BaseSLPEstimator):
         z1, a1, z2, y_pred : tuple of arrays
             Intermediate values for backpropagation
         """
-        # TODO: Implement forward propagation
-        pass
+        activation_fn, _ = self._get_activation_function()
+
+        z1 = X @ self.W1_ + self.b1_
+        a1 = activation_fn(z1)
+        z2 = a1 @ self.W2_ + self.b2_
+        # Softmax handles both binary (K=2) and multi-class uniformly
+        y_pred = softmax(z2)
+
+        return z1, a1, z2, y_pred
 
     def _backward_propagation(
         self,
@@ -101,11 +108,20 @@ class SimpleSLPClassifier(BaseSLPEstimator):
         dW1, db1, dW2, db2 : tuple of arrays
             Gradients for weights and biases
         """
-        # TODO: Implement backpropagation
-        # Compute output layer error
-        # Compute hidden layer error
-        # Compute gradients
-        pass
+        n_samples = X.shape[0]
+        _, activation_derivative_fn = self._get_activation_function()
+
+        # Output layer gradient (softmax + cross-entropy simplifies to y_pred - y)
+        dz2 = (y_pred - y) / n_samples
+        dW2 = a1.T @ dz2
+        db2 = np.sum(dz2, axis=0)
+
+        # Hidden layer gradient (chain rule through activation)
+        dz1 = (dz2 @ self.W2_.T) * activation_derivative_fn(z1)
+        dW1 = X.T @ dz1
+        db1 = np.sum(dz1, axis=0)
+
+        return dW1, db1, dW2, db2
 
     def _compute_loss(
         self, y_true: NDArray[np.floating], y_pred: NDArray[np.floating]
@@ -125,9 +141,9 @@ class SimpleSLPClassifier(BaseSLPEstimator):
         loss : float
             Cross-entropy loss
         """
-        # TODO: Implement cross-entropy loss
-        # Clip predictions to avoid log(0)
-        pass
+        # Clip to avoid log(0) which gives -inf and breaks the loss
+        y_pred = np.clip(y_pred, 1e-15, 1 - 1e-15)
+        return float(-np.mean(np.sum(y_true * np.log(y_pred), axis=1)))
 
     def fit(
         self, X: NDArray[np.floating], y: NDArray[np.int_]
@@ -147,17 +163,42 @@ class SimpleSLPClassifier(BaseSLPEstimator):
         self : object
             Fitted estimator
         """
-        # TODO: Implement training loop
-        # 1. Set random seed if provided
-        # 2. (Bonus for multi-class) Identify unique classes and encode y
-        # 3. Initialize weights
-        # 4. For each iteration:
-        #    - Forward propagation
-        #    - Compute loss
-        #    - Backward propagation
-        #    - Update weights
-        #    - Store loss in loss_curve_
-        pass
+        # Random seed is handled in _initialize_weights via default_rng (local generator)
+
+        y = np.asarray(y)
+        self.classes_ = np.unique(y)
+        n_classes = len(self.classes_)
+
+        # Ensure at least 2 output neurons even when y has a single class
+        self.n_outputs_ = max(n_classes, 2)
+
+        # One-hot encode y using class indices
+        n_samples = X.shape[0]
+        y_indices = np.searchsorted(self.classes_, y)
+        y_onehot = np.zeros((n_samples, self.n_outputs_))
+        y_onehot[np.arange(n_samples), y_indices] = 1
+
+        n_features = X.shape[1]
+        self._initialize_weights(n_features, self.n_outputs_)
+        self.loss_curve_ = []
+
+        for _ in range(self.max_iter):
+            z1, a1, z2, y_pred = self._forward_propagation(X)
+
+            loss = self._compute_loss(y_onehot, y_pred)
+            self.loss_curve_.append(loss)
+
+            dW1, db1, dW2, db2 = self._backward_propagation(
+                X, y_onehot, z1, a1, z2, y_pred
+            )
+
+            # Gradient descent: W = W - learning_rate * gradient
+            self.W1_ -= self.learning_rate * dW1
+            self.b1_ -= self.learning_rate * db1
+            self.W2_ -= self.learning_rate * dW2
+            self.b2_ -= self.learning_rate * db2
+
+        return self
 
     def predict_proba(self, X: NDArray[np.floating]) -> NDArray[np.floating]:
         """
@@ -173,9 +214,8 @@ class SimpleSLPClassifier(BaseSLPEstimator):
         proba : array-like, shape (n_samples, n_classes)
             Class probabilities
         """
-        # TODO: Implement prediction
-        # Use forward propagation and return softmax output
-        pass
+        _, _, _, y_pred = self._forward_propagation(X)
+        return y_pred
 
     def predict(self, X: NDArray[np.floating]) -> NDArray[np.int_]:
         """
@@ -191,9 +231,10 @@ class SimpleSLPClassifier(BaseSLPEstimator):
         y_pred : array-like, shape (n_samples,)
             Predicted class labels
         """
-        # TODO: Implement prediction
-        # Get probabilities and return class with highest probability
-        pass
+        proba = self.predict_proba(X)
+        # argmax gives the column index of max proba; map back to the actual class label
+        class_indices = np.argmax(proba, axis=1)
+        return self.classes_[class_indices]
 
     def score(self, X: NDArray[np.floating], y: NDArray[np.int_]) -> float:
         """
@@ -211,5 +252,4 @@ class SimpleSLPClassifier(BaseSLPEstimator):
         score : float
             Mean accuracy
         """
-        # TODO: Implement accuracy computation
-        pass
+        return float(np.mean(self.predict(X) == np.asarray(y)))

@@ -692,3 +692,357 @@ assez petit pour ne pas saturer tanh/sigmoid sur les grands réseaux.
 Alternative plus rigoureuse (non implémentée pour rester simple) :
 adapter σ à n_features selon He pour ReLU, Xavier pour tanh/sigmoid.
 Notre σ unique passe tous les tests sans complexifier le code.
+
+## Phase 4 — Implémentation du Classifier
+
+### 4.1 Forward propagation
+
+**Équations du réseau (one hidden layer, classification)**
+
+    z₁ = X @ W₁ + b₁              (combinaison linéaire couche cachée)
+    a₁ = σ(z₁)                    (activation non-linéaire)
+    z₂ = a₁ @ W₂ + b₂             (combinaison linéaire sortie)
+    ŷ  = softmax(z₂)              (probabilités, somment à 1 par ligne)
+
+Différence avec le régresseur : UNIQUEMENT la dernière étape.
+Régresseur : ŷ = z₂ (identité)
+Classifier : ŷ = softmax(z₂) (distribution de probabilité)
+
+**Shapes**
+
+    X     : (n_samples, n_features)
+    z₂,ŷ  : (n_samples, K)        K = nombre de classes
+
+Pour chaque ligne i :
+    Σⱼ ŷᵢⱼ = 1
+    ŷᵢⱼ = P(classe = j | xᵢ) estimée par le modèle
+
+**Choix architectural : softmax pour binaire ET multi-classe**
+
+Tradition pédagogique : sigmoid pour binaire (1 sortie), softmax pour
+multi-classe (K sorties). Mais softmax avec K=2 ≡ sigmoid (cf. section 1.4
+des notes). Donc on utilise softmax dans TOUS les cas, avec :
+- K=2 pour le binaire → 2 outputs : (P(classe 0), P(classe 1))
+- K≥3 pour le multi-classe → K outputs
+
+Avantages :
+- Code unique, pas de branche if/else binaire vs multi-classe
+- Cohérence mathématique : la backprop est rigoureusement la même
+- Aligné avec sklearn qui utilise aussi softmax+CE même en binaire
+- predict_proba retourne toujours (n, K) → format sklearn-compatible
+
+Inconvénient :
+- Légèrement plus de paramètres en binaire (2 colonnes de W₂ au lieu de 1)
+- Coût négligeable, l'overhead est invisible en pratique
+
+**Pourquoi pas d'activation de sortie séparée dans le code ?**
+
+Dans le code de _forward_propagation, on appelle softmax directement
+plutôt que de passer par self._get_activation_function() (qui retourne
+relu/tanh/logistic pour la couche cachée). Raison : softmax n'est pas
+une activation cachée — elle s'applique uniquement à la sortie en
+classification. La séparation "activation cachée vs activation sortie"
+est claire et défendable.
+
+### 4.2 Loss : Cross-entropy
+
+**Définition (cas multi-classe, K classes)**
+
+    L = -(1/n) Σᵢ Σₖ yᵢₖ · log(ŷᵢₖ)
+
+où :
+    yᵢₖ = 1 si la vraie classe du sample i est k, 0 sinon (one-hot)
+    ŷᵢₖ = probabilité prédite que sample i appartienne à classe k
+
+**Simplification grâce au one-hot**
+
+Pour chaque sample i, un SEUL yᵢₖ vaut 1 (celui de la vraie classe).
+Donc Σₖ yᵢₖ · log(ŷᵢₖ) = log(ŷ pour la vraie classe).
+
+Conséquence : la cross-entropy mesure à quel point le modèle est
+confiant DANS LA BONNE CLASSE.
+
+Exemples :
+    ŷ = 0.99 pour la bonne classe → -log(0.99) ≈ 0.01 → loss faible ✓
+    ŷ = 0.5  pour la bonne classe → -log(0.5)  ≈ 0.69 → loss moyenne
+    ŷ = 0.01 pour la bonne classe → -log(0.01) ≈ 4.6  → loss très grande ✗
+
+**Propriétés**
+
+- L ≥ 0 toujours (car log(x) ≤ 0 pour x ∈ [0,1], inversé par le moins)
+- L = 0 ssi le modèle prédit 1.0 pour la bonne classe partout
+- Non bornée vers le haut : peut tendre vers +∞ si ŷ → 0 sur la vraie classe
+
+**Pourquoi cross-entropy plutôt que MSE pour la classification ?**
+
+1. Pénalisation logarithmique
+   Cross-entropy explose vers +∞ quand on est très confiant dans la
+   MAUVAISE réponse. MSE est bornée à 1 dans ce cas. CE force le modèle
+   à mieux calibrer ses probabilités.
+
+2. Compatibilité algébrique avec softmax
+   La dérivée combinée ∂CE/∂z₂ = ŷ - y se simplifie en backprop.
+   Ne marche pas avec MSE.
+
+3. Origine probabiliste (Maximum Likelihood Estimation)
+   Cross-entropy = log-vraisemblance négative d'un modèle multinomial.
+   C'est la loss "naturelle" du point de vue statistique :
+   minimiser la CE ⟺ maximiser la vraisemblance des données.
+
+**Piège numérique : log(0)**
+
+Si softmax produit ŷ très petit (ex. e^-1000 ≈ 10⁻⁴³⁴), alors :
+    log(ŷ) → -∞ → NaN → la loss casse
+
+Solution : clipper ŷ à [ε, 1-ε] avec ε = 10⁻¹⁵.
+Erreur numérique introduite : invisible (10⁻¹⁵ proche du minimum
+représentable en float64), aucune erreur perceptible sur le résultat.
+
+**Lien avec la cross-entropy binaire (BCE)**
+
+Cas binaire (K=2), y ∈ {0,1}, ŷ ∈ [0,1] :
+    BCE = -(1/n) Σ [y·log(ŷ) + (1-y)·log(1-ŷ)]
+
+Avec softmax K=2 + one-hot K=2, on récupère exactement la même formule
+(développement immédiat). Donc notre implémentation multi-classe
+englobe correctement le cas binaire.
+
+**Choix d'implémentation**
+
+- np.clip à 1e-15 : standard de l'industrie (sklearn, TF, PyTorch).
+- y_true * np.log(y_pred) : multiplication ÉLÉMENT par ÉLÉMENT.
+  Le one-hot fait le tri automatiquement (les 0 annulent les classes
+  non pertinentes).
+- np.sum(axis=1) puis np.mean() : somme sur les classes pour chaque
+  sample, puis moyenne sur les samples. Ordre important : si on
+  faisait np.mean() seul sur le tableau 2D, on diviserait aussi par K.
+
+### 4.3 Backpropagation
+
+**Pattern identique au régresseur, sauf la valeur de dz₂**
+
+    dz₂ = ?                              ← seule différence
+    dW₂ = a₁ᵀ · dz₂
+    db₂ = Σ_samples dz₂
+    dz₁ = (dz₂ · W₂ᵀ) ⊙ σ'(z₁)
+    dW₁ = Xᵀ · dz₁
+    db₁ = Σ_samples dz₁
+
+**Démonstration : dz₂ = ŷ - y_onehot (pour softmax + cross-entropy)**
+
+Soit un sample, K classes, y = one-hot, ŷ = softmax(z₂),
+L = -Σₖ yₖ log(ŷₖ).
+
+(1) Chain rule
+    ∂L/∂z₂ᵢ = Σₖ (∂L/∂ŷₖ) · (∂ŷₖ/∂z₂ᵢ)
+
+(2) Dérivée de L par rapport à ŷₖ
+    ∂L/∂ŷₖ = -yₖ / ŷₖ
+
+(3) Dérivée de softmax (résultat classique)
+    ∂ŷₖ/∂z₂ᵢ = ŷᵢ(1 - ŷᵢ)   si k = i
+             = -ŷₖ · ŷᵢ      si k ≠ i
+
+(4) On substitue
+    ∂L/∂z₂ᵢ = (-yᵢ/ŷᵢ) · ŷᵢ(1-ŷᵢ) + Σ_{k≠i} (-yₖ/ŷₖ) · (-ŷₖŷᵢ)
+            = -yᵢ(1-ŷᵢ) + ŷᵢ · Σ_{k≠i} yₖ
+            = -yᵢ + yᵢŷᵢ + ŷᵢ · Σ_{k≠i} yₖ
+            = -yᵢ + ŷᵢ · Σₖ yₖ              (regroupement)
+
+(5) y est un one-hot ⟹ Σₖ yₖ = 1
+
+    ∂L/∂z₂ᵢ = ŷᵢ - yᵢ
+
+(6) En vectoriel et en batchant sur n samples :
+
+    dz₂ = (1/n) · (ŷ - y_onehot)
+
+**Coïncidence des formes : régresseur vs classifier**
+
+    Régresseur : identity + MSE          → dz₂ = (1/n)(ŷ - y)
+    Classifier : softmax + cross-entropy → dz₂ = (1/n)(ŷ - y_onehot)
+    Binaire    : sigmoid + binary CE     → dz₂ = (1/n)(ŷ - y)
+
+Trois lois, même forme. Ce n'est PAS un hasard mathématique : c'est
+une propriété fondamentale des "matched pairs" (loss, activation)
+issues du cadre des Modèles Linéaires Généralisés (GLM). Chaque famille
+exponentielle (Gaussien → MSE, Bernoulli → BCE, Multinomial → CE)
+a sa fonction de lien canonique (identity, sigmoid, softmax) dont la
+log-vraisemblance se dérive avec cette forme universelle.
+
+**Conséquence pratique**
+
+Le code de _backward_propagation du classifier est ligne pour ligne
+identique à celui du régresseur. Seul le commentaire change pour
+pointer la justification math différente. Cette identité de code n'est
+pas une coïncidence d'implémentation : c'est le reflet de la math.
+
+**Vérification des shapes (inchangées par rapport au régresseur)**
+
+    Tous les dW et db ont la shape du paramètre qu'ils dérivent :
+    dW₁ shape (n_features, H), dW₂ shape (H, K), etc.
+    Voir tableau de shapes en section 3.3.
+
+### 4.4 La méthode fit() — gestion des classes et one-hot
+
+**Différences avec fit() du régresseur**
+
+1. Détection automatique des classes via np.unique(y)
+2. One-hot encoding de y avant la boucle d'apprentissage
+3. Gestion du cas pathologique d'une seule classe
+
+Tout le reste (boucle d'entraînement, gradient descent) est identique.
+
+**One-hot encoding : la transformation**
+
+Exemple avec 3 classes :
+    y = [0, 2, 1, 0]
+    y_onehot = [[1,0,0], [0,0,1], [0,1,0], [1,0,0]]
+
+Chaque label devient un vecteur ligne avec un seul 1 à la position
+correspondant à la vraie classe.
+
+**Pourquoi encoder y en one-hot ?**
+
+La cross-entropy multi-classe et la formule dz₂ = ŷ - y_onehot exigent
+que y ait la même shape que ŷ (n_samples, K). Or y arrive en (n_samples,)
+sous forme de labels entiers. Le one-hot fait le pont.
+
+**Implémentation vectorisée (pas de boucle)**
+
+    y_indices = np.searchsorted(self.classes_, y)   # labels → indices
+    y_onehot  = np.zeros((n, K))
+    y_onehot[np.arange(n), y_indices] = 1            # fancy indexing
+
+np.searchsorted gère le cas où les classes ne sont pas {0, 1, ..., K-1}
+mais des entiers arbitraires (ex: classes [10, 20, 30]) ou même des
+strings. Plus robuste qu'utiliser y directement comme indices.
+
+Fancy indexing : y_onehot[arange(n), y_indices] = 1 met à 1 exactement
+les positions (sample i, classe y_indices[i]) pour chaque sample,
+sans boucle Python.
+
+**Cas pathologique : y avec une seule classe**
+
+Test test_all_same_class : y = [0, 0, 0, ...].
+np.unique retourne [0], donc n_classes = 1.
+
+Problème : softmax sur K=1 output donnerait toujours 1.0 (proba = 1 par
+construction), gradient = 0, le modèle n'apprend rien d'utile.
+
+Solution : forcer n_outputs_ = max(n_classes, 2). Avec 2 outputs et
+y_onehot qui n'a que la colonne 0 active, la colonne 1 ne reçoit jamais
+de signal positif → le modèle apprend à toujours prédire classe 0.
+Test vérifie : assert np.all(clf.predict(X) == 0). ✓
+
+**Pourquoi self.classes_ avec underscore final ?**
+
+Convention scikit-learn : tout attribut appris à partir des données
+(par fit()) se termine par un underscore. Cohérent avec W1_, b1_, etc.
+
+**Pourquoi self.n_outputs_ stocké séparément**
+
+Le test test_weight_shapes vérifie clf.b2_.shape[0] == clf.n_outputs_.
+On stocke explicitement n_outputs_ pour exposer cette info après fit(),
+en plus de servir au reshape interne.
+
+**Choix de défauts : activation="relu" et learning_rate=0.01**
+
+Mêmes raisons que pour le régresseur (cf. notes Phase 3) :
+- relu : convergence plus rapide, alignement sklearn
+- lr=0.01 : compromis convergence/stabilité pour notre gradient
+  descent vanille (sans solveur adaptatif type adam)
+
+### 4.5 predict_proba() et predict()
+
+**predict_proba() : retourner les probabilités**
+
+Sortie : (n_samples, n_classes), chaque ligne somme à 1.
+
+Implémentation triviale : c'est exactement la sortie de _forward_propagation,
+puisque y_pred = softmax(z₂) produit déjà des probabilités. Aucun calcul
+supplémentaire.
+
+**predict() : retourner les classes prédites**
+
+Sortie : (n_samples,), valeurs dans self.classes_.
+
+Règle de décision : argmax sur les probabilités → choisir la classe
+la plus probable pour chaque sample.
+
+    ŷᵢ = classes_[argmax_k(predict_proba[i, k])]
+
+**Pourquoi mapper via self.classes_ et pas retourner directement argmax ?**
+
+argmax retourne des INDICES (0, 1, ..., K-1) qui sont les positions dans
+self.classes_. Mais les labels réels peuvent être différents :
+    classes_ = [10, 20, 30]  → argmax = 2 doit retourner 30 (pas 2)
+    classes_ = ["a", "b"]    → argmax = 1 doit retourner "b" (pas 1)
+
+L'indexation numpy self.classes_[class_indices] fait la traduction
+automatiquement, sans boucle Python.
+
+Cas pratique : np.unique() retourne les classes triées par ordre croissant,
+donc pour breast cancer (labels 0 et 1), argmax = label. Mais pour un
+dataset où les labels seraient [2, 5, 7], on aurait besoin du mapping.
+
+**Pourquoi déléguer predict() à predict_proba() ?**
+
+DRY : pas de duplication de la logique forward. Si on changeait l'activation
+de sortie (improbable pour ce projet, mais quand même), un seul endroit
+à modifier.
+
+Test test_predict_shape_and_labels vérifie set(predict(X)).issubset(set(y_train)) :
+chaque prédiction doit être un label valide vu pendant l'entraînement.
+Notre mapping via classes_ garantit ça par construction.
+
+**Lien entre predict_proba et predict (cas binaire)**
+
+En binaire, predict_proba retourne (P(classe 0), P(classe 1)) pour chaque
+sample. Le seuil de décision implicite est 0.5 :
+    P(classe 1) > 0.5 ⟺ argmax = 1 ⟺ predict() retourne classe 1
+
+Modifier ce seuil (typiquement utile pour gérer le déséquilibre de classes)
+n'est pas implémenté, mais predict_proba permettrait à l'utilisateur de
+le faire à la main si besoin.
+
+### 4.6 score() : accuracy
+
+**Définition**
+
+    accuracy = (1/n) Σᵢ 1[ŷᵢ = yᵢ]
+
+= proportion de prédictions correctes, dans [0, 1].
+
+**Pourquoi accuracy plutôt que cross-entropy comme métrique ?**
+
+Cross-entropy est la LOSS qu'on optimise pendant l'entraînement. Mais
+elle n'est pas interprétable directement (loss = 0.5 c'est bien ou mal ?).
+
+Accuracy est interprétable immédiatement (85 % de bonnes réponses).
+Convention sklearn : .score() retourne la métrique utilisateur (accuracy
+ici, R² pour la régression), pas la loss interne.
+
+**Limitations d'accuracy (utile à mentionner en soutenance)**
+
+Accuracy est trompeuse sur les datasets DÉSÉQUILIBRÉS :
+    Cancer rare : 99 % de bénins, 1 % de malins.
+    Modèle qui prédit toujours "bénin" : accuracy = 99 %. Mais inutile.
+
+Métriques alternatives (non implémentées, à connaître) :
+- Precision, Recall, F1-score (par classe)
+- ROC-AUC (pour binaire avec probabilités)
+- Confusion matrix (analyse détaillée des erreurs)
+
+Pour breast cancer (35 % malins, 65 % bénins), accuracy est OK mais
+on pourrait aussi reporter F1 dans le rapport pour montrer qu'on est
+conscient de ce point.
+
+**Choix d'implémentation : np.mean sur booléens**
+
+(predict(X) == y) → array de booléens (True/False).
+np.mean automatiquement convertit True → 1.0, False → 0.0, puis fait
+la moyenne. Plus concis que np.sum() / len(y).
+
+float() à la fin : conversion en float Python natif (la signature
+de la fonction exige -> float, pas np.float64).
