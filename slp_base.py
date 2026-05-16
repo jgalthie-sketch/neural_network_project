@@ -73,12 +73,25 @@ class BaseSLPEstimator(ABC):
         else:
             raise ValueError(f"Unknown activation: {self.activation}")
 
-    def _initialize_weights(self) -> None:
+    def _initialize_weights(self, n_features: int, n_outputs: int) -> None:
         """
-        Initialize weights and biases.
+        Initialize W1, b1, W2, b2 with small random values (normal distribution).
+        Biases are initialized to zero. Symmetry breaking is ensured by W only.
+
+        Parameters:
+        -----------
+        n_features : int
+            Number of input features
+        n_outputs : int
+            Number of output neurons (1 for regression/binary, K for K-class)
         """
-        # TODO: Initialize weights using small random values (e.g., normal distribution with 0 mean and 0.01 standard deviation)
-        pass
+        rng = np.random.default_rng(self.random_state)
+
+        # Small std dev (0.01) keeps initial z in the active zone of activations
+        self.W1_ = rng.normal(0, 0.01, size=(n_features, self.hidden_layer_size))
+        self.b1_ = np.zeros(self.hidden_layer_size)
+        self.W2_ = rng.normal(0, 0.01, size=(self.hidden_layer_size, n_outputs))
+        self.b2_ = np.zeros(n_outputs)
 
     @abstractmethod
     def _forward_propagation(self, X: NDArray[np.floating]) -> Tuple[

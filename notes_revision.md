@@ -254,3 +254,68 @@ En binaire (K=2), avec z = [z₁, z₂] :
 
 Donc softmax binaire = sigmoid d'une différence. C'est pour ça qu'on dit
 que softmax "généralise" sigmoid au cas multi-classe.
+
+## Phase 2 — Initialisation des poids
+
+### Les 4 paramètres à initialiser
+
+Pour un réseau à une couche cachée :
+- W₁ : shape (n_features, hidden_layer_size) — poids input → hidden
+- b₁ : shape (hidden_layer_size,) — biais de la hidden layer
+- W₂ : shape (hidden_layer_size, n_outputs) — poids hidden → output
+- b₂ : shape (n_outputs,) — biais de la output layer
+
+Total à apprendre : (n_features × H) + H + (H × n_outputs) + n_outputs paramètres.
+Pour breast cancer (30 features, H=30, binaire) : 30×30 + 30 + 30×1 + 1 = 961 paramètres.
+
+### Pourquoi pas zéro ? Le problème de symétrie
+
+Si W₁ = 0 partout, alors :
+    z₁ = X @ 0 + 0 = 0 pour tous les neurones cachés
+    a₁ = activation(0) = constante identique pour tous les neurones
+
+Tous les neurones produisent la même valeur. Pendant la backprop, ils
+reçoivent tous le même gradient (par symétrie), donc sont mis à jour de
+manière identique. Itération après itération, ils restent identiques.
+
+Conséquence : un réseau à 100 neurones cachés initialisés à 0 se comporte
+comme un réseau à 1 seul neurone caché. On perd toute la capacité du modèle.
+
+### Pourquoi des valeurs ALÉATOIRES casse la symétrie
+
+Chaque neurone reçoit une initialisation différente → produit une valeur
+différente → reçoit un gradient différent → évolue différemment.
+Les neurones se spécialisent progressivement sur des features différentes
+des données.
+
+### Pourquoi un PETIT écart-type (0.01) ?
+
+Compromis entre deux extrêmes :
+- σ trop grand → z = X·W est grand en valeur absolue → activations saturent
+  (sigmoid et tanh donnent ≈ 0 ou ≈ 1 → dérivée ≈ 0 → vanishing gradient
+  dès l'itération 1, le réseau n'apprend pas).
+- σ trop petit → z trop proche de 0 → activations toutes très proches → 
+  signaux trop similaires entre neurones → apprentissage lent.
+
+σ = 0.01 est une valeur "raisonnable par défaut" recommandée par le brief.
+Il existe des schémas d'init plus sophistiqués (Xavier/Glorot, He) qui
+adaptent σ à la taille des couches pour un meilleur conditionnement,
+mais ils ne sont pas demandés ici.
+
+### Pourquoi les biais peuvent rester à zéro
+
+Le problème de symétrie ne concerne QUE les poids W. Les biais sont juste
+des décalages additifs : tant que les W sont différents, les neurones se
+différencient même si tous les b commencent à 0. Convention standard.
+
+### Reproductibilité (random_state)
+
+np.random.default_rng(seed) crée un générateur déterministe : avec le
+même seed, on obtient toujours la même séquence de nombres aléatoires.
+Indispensable pour :
+- déboguer (résultats reproductibles)
+- comparer deux modèles dans des conditions équivalentes
+- faire passer le test test_reproducibility
+
+Si seed=None, le générateur est initialisé avec une source d'entropie système
+(horloge, etc.) → résultats différents à chaque exécution.
