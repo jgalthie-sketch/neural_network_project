@@ -1046,3 +1046,25 @@ la moyenne. Plus concis que np.sum() / len(y).
 
 float() à la fin : conversion en float Python natif (la signature
 de la fonction exige -> float, pas np.float64).
+
+### Normalisation de y en régression (Phase 5)
+
+Le brief recommande explicitement de normaliser X ET y en régression :
+"Normalize/standardize input features and continuous targets for better convergence"
+
+Pourquoi : ReLU n'est pas borné en sortie, donc avec une cible de grande
+magnitude (diabetes : y ∈ [25, 346]), le gradient initial dz₂ = (ŷ - y)
+peut atteindre -150 à -300 dès la première itération. Multiplié par
+learning_rate=0.01 et l'effet d'amplification via les couches, les poids
+peuvent diverger en quelques itérations → NaN par overflow.
+
+Solution standard : centrer-réduire y_train (sklearn StandardScaler).
+y_train_scaled ∈ ~[-2, +2] → gradients raisonnables → convergence stable.
+
+Conséquence pratique : il faut dénormaliser les prédictions
+(scaler_y.inverse_transform) avant de calculer R² ou de comparer à
+sklearn, pour garder un score interprétable dans l'échelle originale.
+
+Note : sklearn.MLPRegressor n'a pas ce problème car son solveur adam
+adapte le learning rate automatiquement. Notre gradient descent vanille
+demande cette précaution.
